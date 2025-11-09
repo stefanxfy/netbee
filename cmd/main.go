@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"netbee/pkg/comm/color"
 	"netbee/pkg/core"
@@ -54,6 +55,9 @@ func main() {
 
 		// 包数量控制选项
 		packetCount = flag.Int("c", 0, "捕获指定数量的数据包后自动退出 (例如: -c 100)")
+
+		// 输出文件选项
+		outputFile = flag.String("w", "", "将输出内容保存到指定文件 (例如: -w output.txt)")
 
 		// 其他选项
 		help = flag.Bool("help", false, "显示更多帮助信息")
@@ -219,8 +223,25 @@ func main() {
 		cancel()
 	}()
 
+	// 处理输出文件
+	var outputWriter io.Writer = os.Stdout
+	var outputFileHandle *os.File
+	// 如果有 -w 参数，自动禁用颜色输出
+	disableColor := *noColor
+	if *outputFile != "" {
+		disableColor = true // 使用 -w 时自动禁用颜色
+		var err error
+		outputFileHandle, err = os.Create(*outputFile)
+		if err != nil {
+			log.Fatalf("无法创建输出文件 %s: %v", *outputFile, err)
+		}
+		outputWriter = outputFileHandle
+		defer outputFileHandle.Close()
+		log.Printf("输出将保存到文件: %s", *outputFile)
+	}
+
 	// 创建颜色管理器
-	colorManager := color.NewColorManager(*noColor, false)
+	colorManager := color.NewColorManager(disableColor, false)
 
 	// Start reading from network packet ring buffer
 	go func() {
@@ -229,9 +250,9 @@ func main() {
 			log.Printf("将捕获 %d 个数据包后自动退出", *packetCount)
 		}
 		// 输出字段名标题行
-		fmt.Printf("%-20s %-15s %-15s %-8s %-6s %-17s %-3s %-20s\n",
+		fmt.Fprintf(outputWriter, "%-20s %-15s %-15s %-8s %-6s %-17s %-3s %-20s\n",
 			"Time", "SrcIP", "DstIP", "Protocol", "Length", "SrcMAC", "TTL", "Info")
-		fmt.Printf("%-20s %-15s %-15s %-8s %-6s %-17s %-3s %-20s\n",
+		fmt.Fprintf(outputWriter, "%-20s %-15s %-15s %-8s %-6s %-17s %-3s %-20s\n",
 			"----", "-----", "-----", "--------", "------", "------", "---", "----")
 
 		// 包计数器
@@ -267,7 +288,10 @@ func main() {
 				formattedEvent := colorManager.FormatEvent(&event, symbolResolver)
 
 				// 输出格式化的事件
-				formattedEvent.Print()
+				fmt.Fprintf(outputWriter, "%-20s %-15s %-15s %-8s %-6d %-17s %-3s %-20s\n",
+					formattedEvent.Time, formattedEvent.SrcIP, formattedEvent.DstIP,
+					formattedEvent.Protocol, formattedEvent.Length, formattedEvent.SrcMAC,
+					formattedEvent.TTL, formattedEvent.Info)
 
 				// 检查是否达到指定的包数量
 				if *packetCount > 0 && packetCounter >= *packetCount {

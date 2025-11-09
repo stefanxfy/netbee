@@ -55,6 +55,14 @@ func ShowSimpleHelp() {
 	fmt.Println("        示例: -c 100")
 	fmt.Println()
 
+	// 输出文件选项
+	fmt.Println("输出文件选项:")
+	fmt.Println("  -w string")
+	fmt.Println("        将输出内容保存到指定文件")
+	fmt.Println("        使用此选项时，终端不会显示抓包内容，且自动禁用颜色输出")
+	fmt.Println("        示例: -w output.txt")
+	fmt.Println()
+
 	// 帮助参数
 	fmt.Println("其他选项:")
 	fmt.Println("  -help")
@@ -124,6 +132,14 @@ func ShowHelp() {
 	fmt.Println("        示例: -c 100")
 	fmt.Println()
 
+	// 输出文件选项
+	fmt.Println("输出文件选项:")
+	fmt.Println("  -w string")
+	fmt.Println("        将输出内容保存到指定文件")
+	fmt.Println("        使用此选项时，终端不会显示抓包内容，且自动禁用颜色输出")
+	fmt.Println("        示例: -w output.txt")
+	fmt.Println()
+
 	// 使用示例
 	fmt.Println("使用示例:")
 	fmt.Println("  # 监控所有TCP和UDP流量")
@@ -149,4 +165,7 @@ func ShowHelp() {
 	fmt.Println()
 	fmt.Println("  # 禁用颜色输出")
 	fmt.Println("  sudo ./target/netbee -no-color")
+	fmt.Println()
+	fmt.Println("  # 将输出保存到文件（自动禁用颜色）")
+	fmt.Println("  sudo ./target/netbee -w output.txt")
 }
