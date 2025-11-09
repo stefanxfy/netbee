@@ -23,6 +23,7 @@ type SoEvent struct {
 	TcpSeq   uint32
 	TcpAck   uint32
 	TcpLen   uint16
+	TcpMss   uint16 // TCP MSS (Maximum Segment Size)
 	// UDP相关字段
 	UdpLen     uint16
 	FuncName   [32]byte
@@ -33,6 +34,9 @@ type SoEvent struct {
 	// 新增：Netfilter 相关字段
 	NFHook  uint8 // Netfilter 钩子点 (NF_INET_PRE_ROUTING, NF_INET_LOCAL_IN, 等)
 	Verdict int8  // 处理结果 (1=OKFN_NEEDED, -1=DROP, 0=OTHER)
+
+	// 新增：数据包唯一标识符（使用 sk_buff 指针值）
+	PacketID uint64 // 数据包ID，用于标识同一个包经过多个内核函数
 }
 
 // FormatEventInfo 格式化事件信息为字符串
@@ -55,16 +59,23 @@ func (e *SoEvent) FormatEventInfo(symbolResolver *SymbolResolver) string {
 	// 格式化 PID 信息（当 PID > 0 时显示进程名和启动命令）
 	pidInfo := FormatPIDInfo(e.Pid)
 
+	// 格式化 PacketID 信息
+	packetIDInfo := fmt.Sprintf("ID:%d", e.PacketID)
+
 	if e.IPProto == ProtocolTCP {
 		tcpFlags := GetTcpFlagsString(e.TcpFlags)
-		return fmt.Sprintf("%d->%d %s Seq:%d Ack:%d %s [%s] %s%s%s",
-			e.SrcPort, e.DstPort, tcpFlags, e.TcpSeq, e.TcpAck, ifaceName, funcName, pidInfo, stackInfo, nfInfo)
+		mssInfo := ""
+		if e.TcpMss > 0 {
+			mssInfo = fmt.Sprintf(" MSS:%d", e.TcpMss)
+		}
+		return fmt.Sprintf("%d->%d %s %s Seq:%d Ack:%d%s %s [%s] %s%s%s",
+			e.SrcPort, e.DstPort, packetIDInfo, tcpFlags, e.TcpSeq, e.TcpAck, mssInfo, ifaceName, funcName, pidInfo, stackInfo, nfInfo)
 	} else if e.IPProto == ProtocolUDP {
-		return fmt.Sprintf("%d->%d %s [%s] %s%s%s",
-			e.SrcPort, e.DstPort, ifaceName, funcName, pidInfo, stackInfo, nfInfo)
+		return fmt.Sprintf("%d->%d %s %s [%s] %s%s%s",
+			e.SrcPort, e.DstPort, packetIDInfo, ifaceName, funcName, pidInfo, stackInfo, nfInfo)
 	} else {
 		protocol := GetProtocolName(e.IPProto)
-		return fmt.Sprintf("%s %s [%s] %s%s%s", protocol, ifaceName, funcName, pidInfo, stackInfo, nfInfo)
+		return fmt.Sprintf("%s %s [%s] %s %s%s%s", protocol, ifaceName, funcName, packetIDInfo, pidInfo, stackInfo, nfInfo)
 	}
 }
 
@@ -164,6 +175,11 @@ func (e *SoEvent) GetNetfilterInfo() string {
 		return " NF:" + FormatNFInfo(e.NFHook, e.Verdict)
 	}
 	return ""
+}
+
+// GetPacketID 获取数据包唯一标识符
+func (e *SoEvent) GetPacketID() uint64 {
+	return e.PacketID
 }
 
 // ProcessInfo 进程信息
