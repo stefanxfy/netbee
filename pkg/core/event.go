@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 )
@@ -51,16 +52,19 @@ func (e *SoEvent) FormatEventInfo(symbolResolver *SymbolResolver) string {
 	// 获取函数名
 	funcName := e.GetFunctionName()
 
+	// 格式化 PID 信息（当 PID > 0 时显示进程名和启动命令）
+	pidInfo := FormatPIDInfo(e.Pid)
+
 	if e.IPProto == ProtocolTCP {
 		tcpFlags := GetTcpFlagsString(e.TcpFlags)
-		return fmt.Sprintf("%d->%d %s Seq:%d Ack:%d %s [%s] PID:%d%s%s",
-			e.SrcPort, e.DstPort, tcpFlags, e.TcpSeq, e.TcpAck, ifaceName, funcName, e.Pid, stackInfo, nfInfo)
+		return fmt.Sprintf("%d->%d %s Seq:%d Ack:%d %s [%s] %s%s%s",
+			e.SrcPort, e.DstPort, tcpFlags, e.TcpSeq, e.TcpAck, ifaceName, funcName, pidInfo, stackInfo, nfInfo)
 	} else if e.IPProto == ProtocolUDP {
-		return fmt.Sprintf("%d->%d %s [%s] PID:%d%s%s",
-			e.SrcPort, e.DstPort, ifaceName, funcName, e.Pid, stackInfo, nfInfo)
+		return fmt.Sprintf("%d->%d %s [%s] %s%s%s",
+			e.SrcPort, e.DstPort, ifaceName, funcName, pidInfo, stackInfo, nfInfo)
 	} else {
 		protocol := GetProtocolName(e.IPProto)
-		return fmt.Sprintf("%s %s [%s] PID:%d%s%s", protocol, ifaceName, funcName, e.Pid, stackInfo, nfInfo)
+		return fmt.Sprintf("%s %s [%s] %s%s%s", protocol, ifaceName, funcName, pidInfo, stackInfo, nfInfo)
 	}
 }
 
@@ -160,4 +164,60 @@ func (e *SoEvent) GetNetfilterInfo() string {
 		return " NF:" + FormatNFInfo(e.NFHook, e.Verdict)
 	}
 	return ""
+}
+
+// ProcessInfo 进程信息
+type ProcessInfo struct {
+	Name    string // 进程名
+	Cmdline string // 启动命令
+}
+
+// GetProcessInfo 根据 PID 获取进程名和启动命令
+func GetProcessInfo(pid uint32) *ProcessInfo {
+	if pid == 0 {
+		return nil
+	}
+
+	info := &ProcessInfo{}
+
+	// 获取进程名：读取 /proc/PID/comm
+	commPath := fmt.Sprintf("/proc/%d/comm", pid)
+	if commData, err := os.ReadFile(commPath); err == nil {
+		info.Name = strings.TrimSpace(string(commData))
+	}
+
+	// 获取启动命令：读取 /proc/PID/cmdline
+	// cmdline 文件包含进程的完整命令行参数，参数之间用 null 字符分隔
+	cmdlinePath := fmt.Sprintf("/proc/%d/cmdline", pid)
+	if cmdlineData, err := os.ReadFile(cmdlinePath); err == nil {
+		// 将 null 字符替换为空格，并去除末尾的空格
+		cmdline := strings.ReplaceAll(string(cmdlineData), "\x00", " ")
+		info.Cmdline = strings.TrimSpace(cmdline)
+	}
+
+	return info
+}
+
+// FormatPIDInfo 格式化 PID 信息字符串
+// 当 PID > 0 时，显示进程名和启动命令，格式为：PID:进程ID=进程名(启动命令)
+func FormatPIDInfo(pid uint32) string {
+	if pid == 0 {
+		return fmt.Sprintf("PID:%d", pid)
+	}
+
+	procInfo := GetProcessInfo(pid)
+	if procInfo == nil {
+		return fmt.Sprintf("PID:%d", pid)
+	}
+
+	// 格式化显示：PID:进程ID=进程名(启动命令)
+	if procInfo.Name != "" && procInfo.Cmdline != "" {
+		return fmt.Sprintf("PID:%d=%s(%s)", pid, procInfo.Name, procInfo.Cmdline)
+	} else if procInfo.Name != "" {
+		return fmt.Sprintf("PID:%d=%s", pid, procInfo.Name)
+	} else if procInfo.Cmdline != "" {
+		return fmt.Sprintf("PID:%d=%s", pid, procInfo.Cmdline)
+	}
+
+	return fmt.Sprintf("PID:%d", pid)
 }
