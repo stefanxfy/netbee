@@ -48,11 +48,25 @@ func ShowSimpleHelp() {
 	fmt.Println("        禁用颜色输出")
 	fmt.Println()
 
+	// Packet ID 显示选项
+	fmt.Println("数据包合并选项:")
+	fmt.Println("  -ID")
+	fmt.Println("        显示 packet ID，不进行合并（默认：合并相同 packet ID 的数据包）")
+	fmt.Println()
+
 	// 包数量控制选项
 	fmt.Println("包数量控制:")
 	fmt.Println("  -c int")
 	fmt.Println("        捕获指定数量的数据包后自动退出")
 	fmt.Println("        示例: -c 100")
+	fmt.Println()
+
+	// 输出文件选项
+	fmt.Println("输出文件选项:")
+	fmt.Println("  -w string")
+	fmt.Println("        将输出内容保存到指定文件")
+	fmt.Println("        使用此选项时，终端不会显示抓包内容，且自动禁用颜色输出")
+	fmt.Println("        示例: -w output.txt")
 	fmt.Println()
 
 	// 帮助参数
@@ -117,11 +131,27 @@ func ShowHelp() {
 	fmt.Println("        默认启用颜色：RST标志显示红色，TTL>100显示黄色，MAC厂商名称显示黄色")
 	fmt.Println()
 
+	// Packet ID 显示选项
+	fmt.Println("数据包合并选项:")
+	fmt.Println("  -ID")
+	fmt.Println("        显示 packet ID，不进行合并（默认：合并相同 packet ID 的数据包）")
+	fmt.Println("        使用此选项时，每个事件都会单独显示，不会合并相同 packet ID 的事件")
+	fmt.Println("        示例: -ID")
+	fmt.Println()
+
 	// 包数量控制选项
 	fmt.Println("包数量控制:")
 	fmt.Println("  -c int")
 	fmt.Println("        捕获指定数量的数据包后自动退出")
 	fmt.Println("        示例: -c 100")
+	fmt.Println()
+
+	// 输出文件选项
+	fmt.Println("输出文件选项:")
+	fmt.Println("  -w string")
+	fmt.Println("        将输出内容保存到指定文件")
+	fmt.Println("        使用此选项时，终端不会显示抓包内容，且自动禁用颜色输出")
+	fmt.Println("        示例: -w output.txt")
 	fmt.Println()
 
 	// 使用示例
@@ -149,4 +179,14 @@ func ShowHelp() {
 	fmt.Println()
 	fmt.Println("  # 禁用颜色输出")
 	fmt.Println("  sudo ./target/netbee -no-color")
+	fmt.Println()
+	fmt.Println("  # 将输出保存到文件（自动禁用颜色）")
+	fmt.Println("  sudo ./target/netbee -w output.txt")
+	fmt.Println()
+	fmt.Println("  # 显示 packet ID，不进行合并（每个事件单独显示）")
+	fmt.Println("  sudo ./target/netbee -ID")
+	fmt.Println()
+	fmt.Println("  # 合并相同 packet ID 的数据包（默认行为）")
+	fmt.Println("  sudo ./target/netbee")
+	fmt.Println()
 }

@@ -5,13 +5,16 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"netbee/pkg/comm/color"
 	"netbee/pkg/core"
 	"os"
 	"os/signal"
 	"runtime"
+	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
@@ -54,6 +57,12 @@ func main() {
 
 		// 包数量控制选项
 		packetCount = flag.Int("c", 0, "捕获指定数量的数据包后自动退出 (例如: -c 100)")
+
+		// 输出文件选项
+		outputFile = flag.String("w", "", "将输出内容保存到指定文件 (例如: -w output.txt)")
+
+		// Packet ID 显示选项
+		showPacketID = flag.Bool("ID", false, "显示 packet ID，不进行合并（默认：合并相同 packet ID 的数据包）")
 
 		// 其他选项
 		help = flag.Bool("help", false, "显示更多帮助信息")
@@ -219,8 +228,40 @@ func main() {
 		cancel()
 	}()
 
+	// 处理输出文件
+	var outputWriter io.Writer = os.Stdout
+	var outputFileHandle *os.File
+	// 如果有 -w 参数，自动禁用颜色输出
+	disableColor := *noColor
+	if *outputFile != "" {
+		disableColor = true // 使用 -w 时自动禁用颜色
+		var err error
+		outputFileHandle, err = os.Create(*outputFile)
+		if err != nil {
+			log.Fatalf("无法创建输出文件 %s: %v", *outputFile, err)
+		}
+		outputWriter = outputFileHandle
+		defer outputFileHandle.Close()
+		log.Printf("输出将保存到文件: %s", *outputFile)
+	}
+
+	// 创建重传检测器
+	retransmissionDetector := core.NewRetransmissionDetector()
+
 	// 创建颜色管理器
-	colorManager := color.NewColorManager(*noColor, false)
+	colorManager := color.NewColorManager(disableColor, false)
+	// 设置重传检测器到颜色格式化器
+	colorManager.SetRetransmissionDetector(retransmissionDetector)
+
+	// 根据 -ID 参数决定是否使用合并器
+	var merger *core.PacketMerger
+	if !*showPacketID {
+		// 没有 -ID 参数，使用合并器（超时时间 100ms）
+		merger = core.NewPacketMerger(100 * time.Millisecond)
+		log.Println("启用数据包合并功能（相同 packet ID 的数据包将合并显示）")
+	} else {
+		log.Println("启用 packet ID 显示功能（不进行合并，每个事件单独显示）")
+	}
 
 	// Start reading from network packet ring buffer
 	go func() {
@@ -229,13 +270,108 @@ func main() {
 			log.Printf("将捕获 %d 个数据包后自动退出", *packetCount)
 		}
 		// 输出字段名标题行
-		fmt.Printf("%-20s %-15s %-15s %-8s %-6s %-17s %-3s %-20s\n",
+		fmt.Fprintf(outputWriter, "%-20s %-15s %-15s %-8s %-6s %-17s %-3s %-20s\n",
 			"Time", "SrcIP", "DstIP", "Protocol", "Length", "SrcMAC", "TTL", "Info")
-		fmt.Printf("%-20s %-15s %-15s %-8s %-6s %-17s %-3s %-20s\n",
+		fmt.Fprintf(outputWriter, "%-20s %-15s %-15s %-8s %-6s %-17s %-3s %-20s\n",
 			"----", "-----", "-----", "--------", "------", "------", "---", "----")
 
 		// 包计数器
 		packetCounter := 0
+
+		// 如果使用合并器，启动超时刷新处理协程
+		// 使用带缓冲的 channel 和排序机制来保证顺序
+		if merger != nil {
+			// 待打印的事件队列（按时间戳排序）
+			type pendingEvent struct {
+				group     *core.PacketEventGroup
+				firstTime time.Time
+			}
+			pendingEvents := make([]pendingEvent, 0)
+			var pendingMu sync.Mutex
+
+			go func() {
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case key := <-merger.GetFlushChan():
+						// 超时刷新，获取事件组
+						group := merger.GetAndRemoveGroup(key)
+						if group != nil {
+							// 添加到待打印队列
+							pendingMu.Lock()
+							pendingEvents = append(pendingEvents, pendingEvent{
+								group:     group,
+								firstTime: group.GetFirstTime(),
+							})
+							pendingMu.Unlock()
+						}
+					}
+				}
+			}()
+
+			// 定期排序并打印待打印的事件
+			go func() {
+				ticker := time.NewTicker(10 * time.Millisecond) // 每 10ms 检查一次
+				defer ticker.Stop()
+
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						pendingMu.Lock()
+						if len(pendingEvents) > 0 {
+							// 按时间戳排序
+							for i := 0; i < len(pendingEvents)-1; i++ {
+								for j := i + 1; j < len(pendingEvents); j++ {
+									if pendingEvents[i].firstTime.After(pendingEvents[j].firstTime) {
+										pendingEvents[i], pendingEvents[j] = pendingEvents[j], pendingEvents[i]
+									}
+								}
+							}
+
+							// 打印所有待打印的事件
+							for _, pe := range pendingEvents {
+								group := pe.group
+
+								// 使用合并后的 Info 信息（FormatMergedInfo 内部会安全访问 Events）
+								mergedInfo, lastEvent := core.FormatMergedInfoWithRetransmission(group, symbolResolver, retransmissionDetector, !disableColor)
+								if mergedInfo == "" || lastEvent == nil {
+									continue
+								}
+
+								// 使用最后一个事件来格式化输出（但 Info 使用合并后的）
+								formattedEvent := colorManager.FormatEvent(lastEvent, symbolResolver)
+								formattedEvent.Info = mergedInfo
+
+								// 输出格式化的事件
+								fmt.Fprintf(outputWriter, "%-20s %-15s %-15s %-8s %-6d %-17s %-3s %-20s\n",
+									formattedEvent.Time, formattedEvent.SrcIP, formattedEvent.DstIP,
+									formattedEvent.Protocol, formattedEvent.Length, formattedEvent.SrcMAC,
+									formattedEvent.TTL, formattedEvent.Info)
+
+								// 增加包计数器
+								packetCounter++
+
+								// 检查是否达到指定的包数量
+								if *packetCount > 0 && packetCounter >= *packetCount {
+									log.Printf("已捕获 %d 个数据包，程序退出", packetCounter)
+									cancel() // 触发程序退出
+									pendingMu.Unlock()
+									return
+								}
+							}
+
+							// 清空待打印队列
+							pendingEvents = pendingEvents[:0]
+						}
+						pendingMu.Unlock()
+					}
+				}
+			}()
+		}
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -260,20 +396,62 @@ func main() {
 				// Copy data directly from RawSample
 				event = *(*core.SoEvent)(unsafe.Pointer(&record.RawSample[0]))
 
-				// 增加包计数器
-				packetCounter++
+				// 根据 -ID 参数决定处理方式
+				if *showPacketID {
+					// 有 -ID 参数，直接打印，不合并
+					formattedEvent := colorManager.FormatEvent(&event, symbolResolver)
 
-				// 使用颜色管理器格式化事件
-				formattedEvent := colorManager.FormatEvent(&event, symbolResolver)
+					// 输出格式化的事件
+					fmt.Fprintf(outputWriter, "%-20s %-15s %-15s %-8s %-6d %-17s %-3s %-20s\n",
+						formattedEvent.Time, formattedEvent.SrcIP, formattedEvent.DstIP,
+						formattedEvent.Protocol, formattedEvent.Length, formattedEvent.SrcMAC,
+						formattedEvent.TTL, formattedEvent.Info)
 
-				// 输出格式化的事件
-				formattedEvent.Print()
+					// 增加包计数器
+					packetCounter++
 
-				// 检查是否达到指定的包数量
-				if *packetCount > 0 && packetCounter >= *packetCount {
-					log.Printf("已捕获 %d 个数据包，程序退出", packetCounter)
-					cancel() // 触发程序退出
-					return
+					// 检查是否达到指定的包数量
+					if *packetCount > 0 && packetCounter >= *packetCount {
+						log.Printf("已捕获 %d 个数据包，程序退出", packetCounter)
+						cancel() // 触发程序退出
+						return
+					}
+				} else {
+					// 没有 -ID 参数，使用合并器
+					shouldPrint := merger.AddEvent(&event)
+
+					if shouldPrint {
+						// 立即打印（例如收到 kfree_skb）
+						key := core.GetPacketKey(&event)
+						group := merger.GetAndRemoveGroup(key)
+						if group != nil {
+							// 使用合并后的 Info 信息（FormatMergedInfo 内部会安全访问 Events）
+							mergedInfo, lastEvent := core.FormatMergedInfoWithRetransmission(group, symbolResolver, retransmissionDetector, !disableColor)
+							if mergedInfo == "" || lastEvent == nil {
+								continue
+							}
+
+							// 使用最后一个事件来格式化输出（但 Info 使用合并后的）
+							formattedEvent := colorManager.FormatEvent(lastEvent, symbolResolver)
+							formattedEvent.Info = mergedInfo
+
+							// 输出格式化的事件
+							fmt.Fprintf(outputWriter, "%-20s %-15s %-15s %-8s %-6d %-17s %-3s %-20s\n",
+								formattedEvent.Time, formattedEvent.SrcIP, formattedEvent.DstIP,
+								formattedEvent.Protocol, formattedEvent.Length, formattedEvent.SrcMAC,
+								formattedEvent.TTL, formattedEvent.Info)
+
+							// 增加包计数器
+							packetCounter++
+
+							// 检查是否达到指定的包数量
+							if *packetCount > 0 && packetCounter >= *packetCount {
+								log.Printf("已捕获 %d 个数据包，程序退出", packetCounter)
+								cancel() // 触发程序退出
+								return
+							}
+						}
+					}
 				}
 			}
 		}

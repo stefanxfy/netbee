@@ -66,3 +66,13 @@ func (cm *ColorManager) IsEnabled() bool {
 func (cm *ColorManager) GetConfig() *Config {
 	return cm.config
 }
+
+// GetFormatter 获取格式化器
+func (cm *ColorManager) GetFormatter() *ColorFormatter {
+	return cm.formatter
+}
+
+// SetRetransmissionDetector 设置重传检测器
+func (cm *ColorManager) SetRetransmissionDetector(detector *core.RetransmissionDetector) {
+	cm.formatter.SetRetransmissionDetector(detector)
+}

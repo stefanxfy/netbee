@@ -24,6 +24,7 @@ struct so_event {
     __u32 tcp_seq;      // TCP序列号
     __u32 tcp_ack;      // TCP确认号
     __u16 tcp_len;      // TCP数据长度
+    __u16 tcp_mss;      // TCP MSS (Maximum Segment Size)
     // UDP相关字段
     __u16 udp_len;      // UDP数据长度
     char func_name[FUNCNAME_MAX_LEN];  // 函数名
@@ -34,6 +35,9 @@ struct so_event {
     // 新增：Netfilter 相关字段
     __u8 nf_hook;       // Netfilter 钩子点 (NF_INET_PRE_ROUTING, NF_INET_LOCAL_IN, 等)
     __s8 verdict;       // 处理结果 (1=OKFN_NEEDED, -1=DROP, 0=OTHER)
+    
+    // 新增：数据包唯一标识符（使用 sk_buff 指针值）
+    __u64 packet_id;    // 数据包ID，用于标识同一个包经过多个内核函数
 };
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
@@ -102,6 +106,56 @@ static __u32 generate_nf_hook_key(void) {
     
     // 使用简单的哈希算法生成唯一键
     return pid ^ (tid << 16) ^ (bpf_get_smp_processor_id() << 8);
+}
+
+// 解析 TCP 选项中的 MSS
+// 参数：
+//   head: sk_buff 的 head 指针
+//   options_offset: TCP 选项的起始偏移量
+//   options_len: TCP 选项的长度
+// 返回：MSS 值，如果未找到则返回 0
+static __u16 parse_tcp_mss(unsigned char *head, __u32 options_offset, __u32 options_len) {
+    __u16 mss = 0;
+    
+    // 限制选项长度，避免验证器问题（TCP 选项最多 40 字节）
+    if (options_len > 40) {
+        options_len = 40;
+    }
+    
+    // MSS 选项格式：Kind(2) + Length(4) + MSS(2字节)，至少需要 4 字节
+    if (options_len < 4) {
+        return mss;
+    }
+    
+    // 读取选项类型（Kind）
+    __u8 opt_kind = 0;
+    if (bpf_probe_read_kernel(&opt_kind, sizeof(opt_kind), (void *)(head + options_offset)) != 0) {
+        return mss;
+    }
+    
+    // 检查是否为 MSS 选项（Kind = 2）
+    if (opt_kind != 2) {
+        return mss;
+    }
+    
+    // 读取选项长度（Length）
+    __u8 opt_len = 0;
+    if (bpf_probe_read_kernel(&opt_len, sizeof(opt_len), (void *)(head + options_offset + 1)) != 0) {
+        return mss;
+    }
+    
+    // MSS 选项长度必须是 4
+    if (opt_len != 4) {
+        return mss;
+    }
+    
+    // 读取 MSS 值（2 字节，网络字节序）
+    __u16 mss_value = 0;
+    if (bpf_probe_read_kernel(&mss_value, sizeof(mss_value), (void *)(head + options_offset + 2)) == 0) {
+        mss = bpf_ntohs(mss_value);
+    }
+    
+    return mss;
 }
 
 // 参数过滤函数
@@ -233,6 +287,7 @@ static int do_trace_skb(struct pt_regs *ctx, struct sk_buff *skb, const char *fu
     __u32 tcp_seq = 0;
     __u32 tcp_ack = 0;
     __u16 tcp_len = 0;
+    __u16 tcp_mss = 0;  // TCP MSS
     __u16 udp_len = 0;
     
     if (iph.protocol == IPPROTO_TCP || iph.protocol == IPPROTO_UDP) {
@@ -263,6 +318,16 @@ static int do_trace_skb(struct pt_regs *ctx, struct sk_buff *skb, const char *fu
                         tcp_len = ip_total_len - ip_header_len - tcp_header_len;
                     } else {
                         tcp_len = 0;  // 没有数据部分
+                    }
+                    
+                    // 解析 TCP 选项中的 MSS
+                    // TCP 选项在 TCP 固定头部（20字节）之后
+                    if (tcp_header_len > 20) {
+                        __u32 options_offset = transport_offset + 20;  // TCP 固定头部之后
+                        __u32 options_len = tcp_header_len - 20;      // 选项长度
+                        
+                        // 调用 MSS 解析函数
+                        tcp_mss = parse_tcp_mss(head, options_offset, options_len);
                     }
                 } else {
                     tcp_len = 0;  // 无效的TCP头部长度
@@ -389,11 +454,16 @@ static int do_trace_skb(struct pt_regs *ctx, struct sk_buff *skb, const char *fu
     e->src_port = src_port;
     e->dst_port = dst_port;
     
+    // 填充数据包唯一标识符（使用 sk_buff 的 head 指针值）
+    // head 指向数据包的实际数据缓冲区，在 skb 克隆时通常保持不变
+    e->packet_id = (__u64)head;
+    
     // 填充TCP相关字段
     e->tcp_flags = tcp_flags;
     e->tcp_seq = tcp_seq;
     e->tcp_ack = tcp_ack;
     e->tcp_len = tcp_len;
+    e->tcp_mss = tcp_mss;
     
     // 填充UDP相关字段
     e->udp_len = udp_len;

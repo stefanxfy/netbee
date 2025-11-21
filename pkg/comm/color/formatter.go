@@ -16,8 +16,9 @@ type Formatter interface {
 
 // ColorFormatter 颜色格式化器
 type ColorFormatter struct {
-	enabled bool
-	rules   []ColorRule
+	enabled                bool
+	rules                  []ColorRule
+	retransmissionDetector *core.RetransmissionDetector
 }
 
 // NewColorFormatter 创建颜色格式化器
@@ -29,7 +30,13 @@ func NewColorFormatter(enabled bool) *ColorFormatter {
 			&TTLColorRule{},
 			&MACVendorColorRule{},
 		},
+		retransmissionDetector: nil, // 由外部设置
 	}
+}
+
+// SetRetransmissionDetector 设置重传检测器
+func (f *ColorFormatter) SetRetransmissionDetector(detector *core.RetransmissionDetector) {
+	f.retransmissionDetector = detector
 }
 
 // FormatTTL 格式化TTL字段
@@ -78,11 +85,24 @@ func (f *ColorFormatter) FormatInfo(event *core.SoEvent, symbolResolver *core.Sy
 		return infoStr
 	}
 
+	// 检查重传（优先于RST检查）
+	if f.retransmissionDetector != nil && event.IPProto == core.ProtocolTCP {
+		if f.retransmissionDetector.IsRetransmission(event) {
+			return f.applyRetransmissionColor(event, symbolResolver)
+		}
+	}
+
 	// 检查RST标志
 	for _, rule := range f.rules {
 		if rule.Name() == "RST" && rule.ShouldApply(event) {
 			return f.applyRSTColor(event, symbolResolver)
 		}
+	}
+
+	// 检查 NF DROP（对所有协议都适用）
+	if event.Verdict == -1 { // DROP
+		// 将 ":DROP" 替换为 ":红色DROP"
+		infoStr = strings.Replace(infoStr, ":DROP", ":"+ColorRed.Wrap("DROP"), 1)
 	}
 
 	return infoStr
@@ -101,6 +121,54 @@ func (f *ColorFormatter) applyMACVendorColor(macStr string) string {
 		}
 	}
 	return macStr
+}
+
+// applyRetransmissionColor 应用重传颜色（Seq 和 Ack 显示红色）
+func (f *ColorFormatter) applyRetransmissionColor(event *core.SoEvent, symbolResolver *core.SymbolResolver) string {
+	// 获取调用栈信息
+	stackInfo := core.FormatStackTrace(event.StackTrace, event.StackDepth, symbolResolver)
+
+	// 检查是否有 Netfilter 信息
+	var nfInfo string
+	if event.NFHook != 0 || event.Verdict != 0 {
+		nfInfoStr := core.FormatNFInfo(event.NFHook, event.Verdict)
+		// 如果 verdict 是 DROP，将 DROP 显示为红色
+		if event.Verdict == -1 {
+			nfInfoStr = strings.Replace(nfInfoStr, ":DROP", ":"+ColorRed.Wrap("DROP"), 1)
+		}
+		nfInfo = " NF:" + nfInfoStr
+	}
+
+	// 获取接口名称
+	ifaceName := core.IfIndexToName(event.IfIndex)
+
+	// 获取函数名
+	funcName := event.GetFunctionName()
+
+	// 格式化 PID 信息
+	pidInfo := core.FormatPIDInfo(event.Pid)
+
+	// 格式化 PacketID 信息
+	packetIDInfo := fmt.Sprintf("ID:%d", event.PacketID)
+
+	// 获取 TCP 标志
+	tcpFlags := core.GetTcpFlagsString(event.TcpFlags)
+
+	// MSS 信息
+	mssInfo := ""
+	if event.TcpMss > 0 {
+		mssInfo = fmt.Sprintf(" MSS:%d", event.TcpMss)
+	}
+
+	// Seq 和 Ack 用红色显示
+	seqStr := ColorRed.Wrap(fmt.Sprintf("%d", event.TcpSeq))
+	ackStr := ColorRed.Wrap(fmt.Sprintf("%d", event.TcpAck))
+
+	// 在 Info 最前面添加红色的 [TCP Retransmission] 标记
+	retransmissionTag := ColorRed.Wrap("[TCP Retransmission]")
+
+	return fmt.Sprintf("%s %d->%d %s %s Seq:%s Ack:%s%s %s [%s] %s%s%s",
+		retransmissionTag, event.SrcPort, event.DstPort, packetIDInfo, tcpFlags, seqStr, ackStr, mssInfo, ifaceName, funcName, pidInfo, stackInfo, nfInfo)
 }
 
 // applyRSTColor 应用RST标志颜色
@@ -149,7 +217,12 @@ func (f *ColorFormatter) applyRSTColor(event *core.SoEvent, symbolResolver *core
 
 	var nfInfo string
 	if event.NFHook != 0 || event.Verdict != 0 {
-		nfInfo = " NF:" + core.FormatNFInfo(event.NFHook, event.Verdict)
+		nfInfoStr := core.FormatNFInfo(event.NFHook, event.Verdict)
+		// 如果 verdict 是 DROP，将 DROP 显示为红色
+		if event.Verdict == -1 {
+			nfInfoStr = strings.Replace(nfInfoStr, ":DROP", ":"+ColorRed.Wrap("DROP"), 1)
+		}
+		nfInfo = " NF:" + nfInfoStr
 	}
 
 	return fmt.Sprintf("%d->%d %s Seq:%d Ack:%d %s [%s] PID:%d%s%s",
