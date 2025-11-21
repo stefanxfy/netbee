@@ -245,8 +245,13 @@ func main() {
 		log.Printf("输出将保存到文件: %s", *outputFile)
 	}
 
+	// 创建重传检测器
+	retransmissionDetector := core.NewRetransmissionDetector()
+
 	// 创建颜色管理器
 	colorManager := color.NewColorManager(disableColor, false)
+	// 设置重传检测器到颜色格式化器
+	colorManager.SetRetransmissionDetector(retransmissionDetector)
 
 	// 根据 -ID 参数决定是否使用合并器
 	var merger *core.PacketMerger
@@ -331,7 +336,7 @@ func main() {
 								group := pe.group
 
 								// 使用合并后的 Info 信息（FormatMergedInfo 内部会安全访问 Events）
-								mergedInfo, lastEvent := core.FormatMergedInfo(group, symbolResolver)
+								mergedInfo, lastEvent := core.FormatMergedInfoWithRetransmission(group, symbolResolver, retransmissionDetector, !disableColor)
 								if mergedInfo == "" || lastEvent == nil {
 									continue
 								}
@@ -421,7 +426,7 @@ func main() {
 						group := merger.GetAndRemoveGroup(key)
 						if group != nil {
 							// 使用合并后的 Info 信息（FormatMergedInfo 内部会安全访问 Events）
-							mergedInfo, lastEvent := core.FormatMergedInfo(group, symbolResolver)
+							mergedInfo, lastEvent := core.FormatMergedInfoWithRetransmission(group, symbolResolver, retransmissionDetector, !disableColor)
 							if mergedInfo == "" || lastEvent == nil {
 								continue
 							}

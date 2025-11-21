@@ -1,6 +1,8 @@
 package core
 
 import (
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -138,6 +140,13 @@ func (g *PacketEventGroup) GetFirstTime() time.Time {
 // Info 信息：使用最后一个事件的信息，但函数名替换为函数链
 // 返回合并后的 Info 字符串和最后一个事件（用于格式化输出）
 func FormatMergedInfo(group *PacketEventGroup, symbolResolver *SymbolResolver) (string, *SoEvent) {
+	return FormatMergedInfoWithRetransmission(group, symbolResolver, nil, true)
+}
+
+// FormatMergedInfoWithRetransmission 格式化合并后的信息（支持重传检测）
+// 如果 retransmissionDetector 不为 nil，会检测重传并在 Seq 和 Ack 上应用红色
+// colorEnabled 指示是否启用颜色输出
+func FormatMergedInfoWithRetransmission(group *PacketEventGroup, symbolResolver *SymbolResolver, retransmissionDetector *RetransmissionDetector, colorEnabled bool) (string, *SoEvent) {
 	if group == nil {
 		return "", nil
 	}
@@ -187,7 +196,198 @@ func FormatMergedInfo(group *PacketEventGroup, symbolResolver *SymbolResolver) (
 	// ID 格式：ID:数字，可能出现在不同位置
 	info = removeIDFromInfo(info)
 
+	// 应用颜色格式化（RST 标志、重传检测、NF DROP 等）
+	// 注意：这里直接使用 ANSI 颜色代码，避免循环依赖
+	// 重传检测应该始终执行，不管颜色是否启用
+	isRetransmission := false
+	if lastEvent.IPProto == ProtocolTCP && retransmissionDetector != nil {
+		isRetransmission = retransmissionDetector.IsRetransmission(lastEvent)
+	}
+
+	// 处理重传标记（无论颜色是否启用）
+	if isRetransmission {
+		// 添加 [TCP Retransmission] 标记（带颜色或不带颜色）
+		if colorEnabled {
+			info = applyRetransmissionColorToInfo(info, lastEvent)
+		} else {
+			info = applyRetransmissionInfoToInfo(info, lastEvent)
+		}
+	} else if colorEnabled {
+		// 如果没有重传，且启用颜色，检查 RST 标志并应用红色
+		if lastEvent.IPProto == ProtocolTCP {
+			if lastEvent.TcpFlags&0x04 != 0 { // RST 标志
+				info = applyRSTColorToInfo(info, lastEvent)
+			}
+		}
+	}
+
+	// 处理 NF DROP 颜色（对所有协议都适用，仅在启用颜色时）
+	// 注意：如果已经应用了重传颜色，重传颜色处理中已经包含了 NF DROP 的颜色
+	if colorEnabled && !isRetransmission && lastEvent.Verdict == -1 { // DROP
+		info = applyNFDropColorToInfo(info)
+	}
+
 	return info, lastEvent
+}
+
+// applyRSTColorToInfo 在 Info 字符串中应用 RST 标志颜色
+func applyRSTColorToInfo(info string, event *SoEvent) string {
+	// 使用 ANSI 颜色代码，避免循环依赖
+	const redStart = "\033[31m"
+	const redEnd = "\033[0m"
+
+	// 重新构建带颜色的 flags 字符串
+	flagParts := make([]string, 0)
+	flags := event.TcpFlags
+
+	if flags&0x01 != 0 { // FIN
+		flagParts = append(flagParts, "FIN")
+	}
+	if flags&0x02 != 0 { // SYN
+		flagParts = append(flagParts, "SYN")
+	}
+	if flags&0x04 != 0 { // RST - 用红色显示
+		flagParts = append(flagParts, redStart+"RST"+redEnd)
+	}
+	if flags&0x08 != 0 { // PSH
+		flagParts = append(flagParts, "PSH")
+	}
+	if flags&0x10 != 0 { // ACK
+		flagParts = append(flagParts, "ACK")
+	}
+	if flags&0x20 != 0 { // URG
+		flagParts = append(flagParts, "URG")
+	}
+	if flags&0x40 != 0 { // ECE
+		flagParts = append(flagParts, "ECE")
+	}
+	if flags&0x80 != 0 { // CWR
+		flagParts = append(flagParts, "CWR")
+	}
+
+	var coloredFlags string
+	if len(flagParts) == 0 {
+		coloredFlags = "NONE"
+	} else {
+		coloredFlags = strings.Join(flagParts, ",")
+	}
+
+	// 查找并替换 flags 部分
+	// 格式通常是：端口->端口 ID:数字 flags Seq:数字 Ack:数字 ...
+	// 我们需要找到 flags 的位置并替换
+	// 使用 GetTcpFlagsString 获取原始 flags 字符串
+	originalFlags := GetTcpFlagsString(event.TcpFlags)
+
+	// 替换 flags 字符串
+	info = strings.Replace(info, originalFlags, coloredFlags, 1)
+
+	// 处理 NF DROP 颜色（如果存在）
+	if event.Verdict == -1 { // DROP
+		dropPattern := ":DROP"
+		dropReplacement := ":" + redStart + "DROP" + redEnd
+		info = strings.Replace(info, dropPattern, dropReplacement, 1)
+	}
+
+	return info
+}
+
+// applyRetransmissionColorToInfo 在 Info 字符串中应用重传颜色（Seq 和 Ack 显示红色）
+func applyRetransmissionColorToInfo(info string, event *SoEvent) string {
+	// 导入 color 包来使用红色
+	// 注意：这里需要避免循环依赖，所以直接使用 ANSI 颜色代码
+	const redStart = "\033[31m"
+	const redEnd = "\033[0m"
+
+	// 在 Info 最前面添加红色的 [TCP Retransmission] 标记
+	retransmissionTag := redStart + "[TCP Retransmission]" + redEnd
+	info = retransmissionTag + " " + info
+
+	// 处理 RST 标志的颜色（如果存在）
+	if event.TcpFlags&0x04 != 0 { // RST 标志
+		// 重新构建带颜色的 flags 字符串
+		flagParts := make([]string, 0)
+		flags := event.TcpFlags
+
+		if flags&0x01 != 0 { // FIN
+			flagParts = append(flagParts, "FIN")
+		}
+		if flags&0x02 != 0 { // SYN
+			flagParts = append(flagParts, "SYN")
+		}
+		if flags&0x04 != 0 { // RST - 用红色显示
+			flagParts = append(flagParts, redStart+"RST"+redEnd)
+		}
+		if flags&0x08 != 0 { // PSH
+			flagParts = append(flagParts, "PSH")
+		}
+		if flags&0x10 != 0 { // ACK
+			flagParts = append(flagParts, "ACK")
+		}
+		if flags&0x20 != 0 { // URG
+			flagParts = append(flagParts, "URG")
+		}
+		if flags&0x40 != 0 { // ECE
+			flagParts = append(flagParts, "ECE")
+		}
+		if flags&0x80 != 0 { // CWR
+			flagParts = append(flagParts, "CWR")
+		}
+
+		var coloredFlags string
+		if len(flagParts) == 0 {
+			coloredFlags = "NONE"
+		} else {
+			coloredFlags = strings.Join(flagParts, ",")
+		}
+
+		// 替换 flags 字符串
+		originalFlags := GetTcpFlagsString(event.TcpFlags)
+		info = strings.Replace(info, originalFlags, coloredFlags, 1)
+	}
+
+	// 替换 Seq:数字 中的数字为红色
+	seqPattern := fmt.Sprintf("Seq:%d", event.TcpSeq)
+	seqReplacement := fmt.Sprintf("Seq:%s%d%s", redStart, event.TcpSeq, redEnd)
+	info = strings.Replace(info, seqPattern, seqReplacement, 1)
+
+	// 替换 Ack:数字 中的数字为红色
+	ackPattern := fmt.Sprintf("Ack:%d", event.TcpAck)
+	ackReplacement := fmt.Sprintf("Ack:%s%d%s", redStart, event.TcpAck, redEnd)
+	info = strings.Replace(info, ackPattern, ackReplacement, 1)
+
+	// 处理 NF DROP 颜色（如果存在）
+	if event.Verdict == -1 { // DROP
+		dropPattern := ":DROP"
+		dropReplacement := ":" + redStart + "DROP" + redEnd
+		info = strings.Replace(info, dropPattern, dropReplacement, 1)
+	}
+
+	return info
+}
+
+// applyRetransmissionInfoToInfo 在 Info 字符串中应用重传标记（不带颜色）
+func applyRetransmissionInfoToInfo(info string, event *SoEvent) string {
+	// 在 Info 最前面添加 [TCP Retransmission] 标记（不带颜色）
+	retransmissionTag := "[TCP Retransmission]"
+	info = retransmissionTag + " " + info
+
+	return info
+}
+
+// applyNFDropColorToInfo 在 Info 字符串中应用 NF DROP 颜色（DROP 显示红色）
+func applyNFDropColorToInfo(info string) string {
+	// 使用 ANSI 颜色代码，避免循环依赖
+	const redStart = "\033[31m"
+	const redEnd = "\033[0m"
+
+	// 查找并替换 ":DROP" 为 ":红色DROP"
+	// 格式通常是：... NF:LOCAL_IN:DROP 或 NF:POST_ROUTING:DROP
+	// 我们需要将 ":DROP" 替换为 ":红色DROP"
+	dropPattern := ":DROP"
+	dropReplacement := ":" + redStart + "DROP" + redEnd
+	info = strings.Replace(info, dropPattern, dropReplacement, 1)
+
+	return info
 }
 
 // replaceFirst 替换字符串中第一次出现的模式
