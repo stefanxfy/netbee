@@ -128,6 +128,19 @@ func (pm *PacketMerger) GetFlushChan() <-chan PacketKey {
 	return pm.flushChan
 }
 
+// DrainGroups 获取并清空当前所有事件组。
+func (pm *PacketMerger) DrainGroups() []*PacketEventGroup {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	groups := make([]*PacketEventGroup, 0, len(pm.groups))
+	for key, group := range pm.groups {
+		groups = append(groups, group)
+		delete(pm.groups, key)
+	}
+	return groups
+}
+
 // GetFirstTime 获取事件组的第一个事件时间戳（用于排序）
 func (g *PacketEventGroup) GetFirstTime() time.Time {
 	g.mu.Lock()

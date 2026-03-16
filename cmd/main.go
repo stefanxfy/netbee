@@ -9,10 +9,13 @@ import (
 	"log"
 	"netbee/pkg/comm/color"
 	"netbee/pkg/core"
+	"netbee/pkg/diagnose"
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -28,43 +31,45 @@ import (
 // Global symbol resolver
 var symbolResolver *core.SymbolResolver
 
+type pendingEvent struct {
+	group     *core.PacketEventGroup
+	firstTime time.Time
+}
+
+type pendingGroupQueue struct {
+	mu     sync.Mutex
+	events []pendingEvent
+}
+
 func main() {
-	// 自定义帮助信息，覆盖默认的 -h 行为
 	flag.Usage = func() {
 		core.ShowSimpleHelp()
 	}
 
-	// 命令行参数定义
 	var (
-		// 协议过滤参数
 		protocols = flag.String("proto", "", "过滤协议，逗号分隔 (tcp,udp,icmp)")
+		srcHost   = flag.String("shost", "", "过滤来源主机IP地址 (例如: 192.168.1.1)")
+		dstHost   = flag.String("dhost", "", "过滤目标主机IP地址 (例如: 8.8.8.8)")
+		host      = flag.String("host", "", "过滤主机IP地址 (来源或目标IP匹配即可)")
 
-		// 主机过滤参数
-		srcHost = flag.String("shost", "", "过滤来源主机IP地址 (例如: 192.168.1.1)")
-		dstHost = flag.String("dhost", "", "过滤目标主机IP地址 (例如: 8.8.8.8)")
-		host    = flag.String("host", "", "过滤主机IP地址 (来源或目标IP匹配即可)")
-
-		// 端口过滤参数
 		srcPort = flag.Int("sport", 0, "过滤来源端口 (例如: 8080)")
 		dstPort = flag.Int("dport", 0, "过滤目的端口 (例如: 80)")
 		port    = flag.Int("port", 0, "过滤端口 (来源端口或目的端口匹配即可)")
 
-		// 调试选项
-		kfree = flag.Bool("kfree", false, "显示kfree_skb的调用栈信息")
-
-		// 颜色输出选项
-		noColor = flag.Bool("no-color", false, "禁用颜色输出")
-
-		// 包数量控制选项
-		packetCount = flag.Int("c", 0, "捕获指定数量的数据包后自动退出 (例如: -c 100)")
-
-		// 输出文件选项
-		outputFile = flag.String("w", "", "将输出内容保存到指定文件 (例如: -w output.txt)")
-
-		// Packet ID 显示选项
+		kfree        = flag.Bool("kfree", false, "显示kfree_skb的调用栈信息")
+		noColor      = flag.Bool("no-color", false, "禁用颜色输出")
+		packetCount  = flag.Int("c", 0, "捕获指定数量的数据包后自动退出 (例如: -c 100)")
+		outputFile   = flag.String("w", "", "将输出内容保存到指定文件 (例如: -w output.txt)")
 		showPacketID = flag.Bool("ID", false, "显示 packet ID，不进行合并（默认：合并相同 packet ID 的数据包）")
 
-		// 其他选项
+		enableAI  = flag.Bool("AI", false, "抓包结束前调用云端 AI 诊断，并将结果写入本地文件")
+		aiUser    = flag.String("ai-user", defaultAIUser(), "AI 诊断请求中的 user 字段")
+		aiOut     = flag.String("ai-out", "", "AI 诊断报告输出路径（默认按时间戳生成 .md 文件）")
+		aiTimeout = flag.Duration("ai-timeout", 120*time.Second, "AI 诊断接口总超时时间")
+		aiRawSave = flag.Bool("ai-raw-save", false, "保存 AI 原始响应 JSON 文件，便于调试")
+		aiAPIKey  = flag.String("ai-api-key", "", "AI 接口鉴权 token（默认读取 NETBEE_AI_API_KEY）")
+		aiAPIURL  = flag.String("ai-api-url", "", "AI 接口地址（默认使用内置 Dify 地址）")
+
 		help = flag.Bool("help", false, "显示更多帮助信息")
 	)
 	flag.Parse()
@@ -74,7 +79,6 @@ func main() {
 		return
 	}
 
-	// 解析过滤条件
 	filterConfig, err := core.ParseFilterConfig(*srcHost, *dstHost, *host, *protocols, *dstPort, *srcPort, *port)
 	if err != nil {
 		log.Fatalf("解析过滤条件失败: %v", err)
@@ -82,14 +86,24 @@ func main() {
 
 	log.Printf("过滤条件: 来源主机=%s, 目标主机=%s, 主机=%s, 协议=%v, 目的端口=%d, 来源端口=%d, 端口=%d",
 		filterConfig.SrcHostStr, filterConfig.DstHostStr, filterConfig.HostStr, filterConfig.Protocols, *dstPort, *srcPort, *port)
-
-	// 输出系统信息用于调试
 	log.Printf("系统架构: %s", runtime.GOARCH)
 	log.Printf("操作系统: %s", runtime.GOOS)
 
-	// kfree 初始化符号解析器
+	aiOptions := diagnose.Options{
+		Enabled:     *enableAI,
+		APIURL:      *aiAPIURL,
+		APIKey:      resolveAPIKey(*aiAPIKey),
+		User:        *aiUser,
+		OutputPath:  *aiOut,
+		Timeout:     *aiTimeout,
+		SaveRaw:     *aiRawSave,
+		MemoryLimit: 2 * 1024 * 1024,
+	}
+	if aiOptions.Enabled && aiOptions.APIKey == "" {
+		log.Fatal("启用 -AI 时必须通过 NETBEE_AI_API_KEY 或 -ai-api-key 提供接口鉴权 token")
+	}
+
 	if *kfree {
-		var err error
 		symbolResolver, err = core.NewSymbolResolver()
 		if err != nil {
 			log.Printf("Warning: Failed to initialize symbol resolver: %v", err)
@@ -99,15 +113,12 @@ func main() {
 		}
 	}
 
-	// Remove memory limit for eBPF
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal("Failed to remove memlock:", err)
 	}
 	_ = os.RemoveAll("/sys/fs/bpf/sarmor")
 
-	// 加载 eBPF 程序规范文件 (netbee.o)
-	bpfPath := "./target/netbee.o"
-	bpfSpec, err := ebpf.LoadCollectionSpec(bpfPath)
+	bpfSpec, err := ebpf.LoadCollectionSpec("./target/netbee.o")
 	if err != nil {
 		var verifierError *ebpf.VerifierError
 		if errors.As(err, &verifierError) {
@@ -117,7 +128,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 创建 eBPF 程序集合
 	coll, err := ebpf.NewCollection(bpfSpec)
 	if err != nil {
 		var verifierError *ebpf.VerifierError
@@ -129,13 +139,11 @@ func main() {
 	}
 	defer coll.Close()
 
-	// 设置过滤配置到eBPF map
 	if err := core.SetFilterConfig(coll, filterConfig, *kfree); err != nil {
 		log.Printf("设置过滤配置失败: %v", err)
 		os.Exit(1)
 	}
 
-	// 定义 kprobe 目标列表
 	kprobeTargets := []struct {
 		progName   string
 		kernelFunc string
@@ -154,8 +162,6 @@ func main() {
 		{"handle_kfree_skb", "__kfree_skb"},
 		{"handle_ip_queue_xmit", "__ip_queue_xmit"},
 	}
-
-	// 定义 kretprobe 目标列表
 	kretprobeTargets := []struct {
 		progName   string
 		kernelFunc string
@@ -163,51 +169,40 @@ func main() {
 		{"handle_nf_hook_slow_ret", "nf_hook_slow"},
 	}
 
-	// 存储所有的 link 用于统一管理
 	var kprobeLinks []link.Link
 	var kretprobeLinks []link.Link
-
-	// 附加 kprobe 程序
 	for _, target := range kprobeTargets {
 		prog := coll.Programs[target.progName]
 		if prog == nil {
 			log.Fatalf("Program '%s' not found in eBPF collection", target.progName)
 		}
-
-		link, err := link.Kprobe(target.kernelFunc, prog, nil)
+		kprobeLink, err := link.Kprobe(target.kernelFunc, prog, nil)
 		if err != nil {
 			log.Fatalf("Failed to attach kprobe to %s: %v", target.kernelFunc, err)
 		}
-		kprobeLinks = append(kprobeLinks, link)
+		kprobeLinks = append(kprobeLinks, kprobeLink)
 	}
-
-	// 附加 kretprobe 程序
 	for _, target := range kretprobeTargets {
 		prog := coll.Programs[target.progName]
 		if prog == nil {
 			log.Fatalf("Program '%s' not found in eBPF collection", target.progName)
 		}
-
-		link, err := link.Kretprobe(target.kernelFunc, prog, nil)
+		kretprobeLink, err := link.Kretprobe(target.kernelFunc, prog, nil)
 		if err != nil {
 			log.Fatalf("Failed to attach kretprobe to %s: %v", target.kernelFunc, err)
 		}
-		kretprobeLinks = append(kretprobeLinks, link)
+		kretprobeLinks = append(kretprobeLinks, kretprobeLink)
 	}
-
-	// 统一关闭所有 link
 	defer func() {
-		for _, link := range kprobeLinks {
-			link.Close()
+		for _, item := range kprobeLinks {
+			item.Close()
 		}
-		for _, link := range kretprobeLinks {
-			link.Close()
+		for _, item := range kretprobeLinks {
+			item.Close()
 		}
 	}()
-
 	log.Println("成功附加 kprobe 到网络层和传输层函数")
 
-	// Get the ring buffers
 	rb, err := ringbuf.NewReader(coll.Maps["rb"])
 	if err != nil {
 		log.Printf("Failed to create network packet ring buffer reader: %v\n", err)
@@ -215,27 +210,47 @@ func main() {
 	}
 	defer rb.Close()
 
-	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Handle interrupt signals
+	var (
+		stopOnce      sync.Once
+		exitReason    = "正常退出"
+		exitReasonMu  sync.Mutex
+		packetCounter int64
+		limitReached  atomic.Bool
+	)
+	packetLimit := int64(*packetCount)
+	requestStop := func(reason string) {
+		stopOnce.Do(func() {
+			exitReasonMu.Lock()
+			exitReason = reason
+			exitReasonMu.Unlock()
+			cancel()
+			if err := rb.Close(); err != nil && !errors.Is(err, ringbuf.ErrClosed) {
+				log.Printf("关闭 ring buffer 失败: %v", err)
+			}
+		})
+	}
+	getExitReason := func() string {
+		exitReasonMu.Lock()
+		defer exitReasonMu.Unlock()
+		return exitReason
+	}
+
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
 		fmt.Println("\nReceived interrupt, shutting down...")
-		cancel()
+		requestStop("收到 Ctrl+C/SIGTERM，中断抓包")
 	}()
 
-	// 处理输出文件
 	var outputWriter io.Writer = os.Stdout
 	var outputFileHandle *os.File
-	// 如果有 -w 参数，自动禁用颜色输出
 	disableColor := *noColor
 	if *outputFile != "" {
-		disableColor = true // 使用 -w 时自动禁用颜色
-		var err error
+		disableColor = true
 		outputFileHandle, err = os.Create(*outputFile)
 		if err != nil {
 			log.Fatalf("无法创建输出文件 %s: %v", *outputFile, err)
@@ -244,219 +259,503 @@ func main() {
 		defer outputFileHandle.Close()
 		log.Printf("输出将保存到文件: %s", *outputFile)
 	}
+	if aiOptions.Enabled && *outputFile == "" {
+		outputWriter = io.Discard
+		log.Println("AI 模式已启用，控制台不再输出抓包明细")
+	}
 
-	// 创建重传检测器
+	var captureBuffer *diagnose.CaptureBuffer
+	if aiOptions.Enabled {
+		captureBuffer = diagnose.NewCaptureBuffer(aiOptions.MemoryLimit)
+		defer captureBuffer.Close()
+		log.Printf("AI 诊断已启用，报告将写入: %s", defaultReportPathHint(aiOptions.OutputPath))
+	}
+
 	retransmissionDetector := core.NewRetransmissionDetector()
+	eventColorManager := color.NewColorManager(disableColor, false)
+	eventColorManager.SetRetransmissionDetector(retransmissionDetector)
+	baseColorManager := color.NewColorManager(disableColor, false)
 
-	// 创建颜色管理器
-	colorManager := color.NewColorManager(disableColor, false)
-	// 设置重传检测器到颜色格式化器
-	colorManager.SetRetransmissionDetector(retransmissionDetector)
-
-	// 根据 -ID 参数决定是否使用合并器
 	var merger *core.PacketMerger
 	if !*showPacketID {
-		// 没有 -ID 参数，使用合并器（超时时间 100ms）
 		merger = core.NewPacketMerger(100 * time.Millisecond)
 		log.Println("启用数据包合并功能（相同 packet ID 的数据包将合并显示）")
 	} else {
 		log.Println("启用 packet ID 显示功能（不进行合并，每个事件单独显示）")
 	}
 
-	// Start reading from network packet ring buffer
-	go func() {
-		log.Println("开始监控网络数据包...")
-		if *packetCount > 0 {
-			log.Printf("将捕获 %d 个数据包后自动退出", *packetCount)
+	startTime := time.Now()
+	pendingQueue := &pendingGroupQueue{}
+	recordPrinted := func() bool {
+		current := atomic.AddInt64(&packetCounter, 1)
+		if packetLimit > 0 && current >= packetLimit {
+			limitReached.Store(true)
+			log.Printf("已捕获 %d 个数据包，程序退出", current)
+			requestStop(fmt.Sprintf("达到抓包数量上限(%d)", packetLimit))
+			return false
 		}
-		// 输出字段名标题行
-		fmt.Fprintf(outputWriter, "%-20s %-15s %-15s %-8s %-6s %-17s %-3s %-20s\n",
-			"Time", "SrcIP", "DstIP", "Protocol", "Length", "SrcMAC", "TTL", "Info")
-		fmt.Fprintf(outputWriter, "%-20s %-15s %-15s %-8s %-6s %-17s %-3s %-20s\n",
-			"----", "-----", "-----", "--------", "------", "------", "---", "----")
+		return true
+	}
+	printDirectEvent := func(event *core.SoEvent) bool {
+		formattedEvent := eventColorManager.FormatEvent(event, symbolResolver)
+		if err := writeOutputLine(outputWriter, captureBuffer, formatTableLine(formattedEvent)); err != nil {
+			log.Printf("写入输出失败: %v", err)
+			requestStop("输出写入失败")
+			return false
+		}
+		return recordPrinted()
+	}
+	printMergedGroup := func(group *core.PacketEventGroup) bool {
+		mergedInfo, lastEvent := core.FormatMergedInfoWithRetransmission(group, symbolResolver, retransmissionDetector, !disableColor)
+		if mergedInfo == "" || lastEvent == nil {
+			return true
+		}
+		formattedEvent := baseColorManager.FormatEvent(lastEvent, symbolResolver)
+		formattedEvent.Info = mergedInfo
+		if err := writeOutputLine(outputWriter, captureBuffer, formatTableLine(formattedEvent)); err != nil {
+			log.Printf("写入输出失败: %v", err)
+			requestStop("输出写入失败")
+			return false
+		}
+		return recordPrinted()
+	}
 
-		// 包计数器
-		packetCounter := 0
+	log.Println("开始监控网络数据包...")
+	if *packetCount > 0 {
+		log.Printf("将捕获 %d 个数据包后自动退出", *packetCount)
+	}
+	if err := writeOutputLine(outputWriter, captureBuffer, formatHeaderLine()); err != nil {
+		log.Fatalf("写入标题失败: %v", err)
+	}
+	if err := writeOutputLine(outputWriter, captureBuffer, formatHeaderSeparatorLine()); err != nil {
+		log.Fatalf("写入标题失败: %v", err)
+	}
 
-		// 如果使用合并器，启动超时刷新处理协程
-		// 使用带缓冲的 channel 和排序机制来保证顺序
-		if merger != nil {
-			// 待打印的事件队列（按时间戳排序）
-			type pendingEvent struct {
-				group     *core.PacketEventGroup
-				firstTime time.Time
+	var wg sync.WaitGroup
+	if merger != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case key := <-merger.GetFlushChan():
+					group := merger.GetAndRemoveGroup(key)
+					if group != nil {
+						pendingQueue.Enqueue(group)
+					}
+				}
 			}
-			pendingEvents := make([]pendingEvent, 0)
-			var pendingMu sync.Mutex
+		}()
 
-			go func() {
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case key := <-merger.GetFlushChan():
-						// 超时刷新，获取事件组
-						group := merger.GetAndRemoveGroup(key)
-						if group != nil {
-							// 添加到待打印队列
-							pendingMu.Lock()
-							pendingEvents = append(pendingEvents, pendingEvent{
-								group:     group,
-								firstTime: group.GetFirstTime(),
-							})
-							pendingMu.Unlock()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					for _, group := range pendingQueue.Drain() {
+						if !printMergedGroup(group) {
+							return
 						}
 					}
 				}
-			}()
+			}
+		}()
+	}
 
-			// 定期排序并打印待打印的事件
-			go func() {
-				ticker := time.NewTicker(10 * time.Millisecond) // 每 10ms 检查一次
-				defer ticker.Stop()
-
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-ticker.C:
-						pendingMu.Lock()
-						if len(pendingEvents) > 0 {
-							// 按时间戳排序
-							for i := 0; i < len(pendingEvents)-1; i++ {
-								for j := i + 1; j < len(pendingEvents); j++ {
-									if pendingEvents[i].firstTime.After(pendingEvents[j].firstTime) {
-										pendingEvents[i], pendingEvents[j] = pendingEvents[j], pendingEvents[i]
-									}
-								}
-							}
-
-							// 打印所有待打印的事件
-							for _, pe := range pendingEvents {
-								group := pe.group
-
-								// 使用合并后的 Info 信息（FormatMergedInfo 内部会安全访问 Events）
-								mergedInfo, lastEvent := core.FormatMergedInfoWithRetransmission(group, symbolResolver, retransmissionDetector, !disableColor)
-								if mergedInfo == "" || lastEvent == nil {
-									continue
-								}
-
-								// 使用最后一个事件来格式化输出（但 Info 使用合并后的）
-								formattedEvent := colorManager.FormatEvent(lastEvent, symbolResolver)
-								formattedEvent.Info = mergedInfo
-
-								// 输出格式化的事件
-								fmt.Fprintf(outputWriter, "%-20s %-15s %-15s %-8s %-6d %-17s %-3s %-20s\n",
-									formattedEvent.Time, formattedEvent.SrcIP, formattedEvent.DstIP,
-									formattedEvent.Protocol, formattedEvent.Length, formattedEvent.SrcMAC,
-									formattedEvent.TTL, formattedEvent.Info)
-
-								// 增加包计数器
-								packetCounter++
-
-								// 检查是否达到指定的包数量
-								if *packetCount > 0 && packetCounter >= *packetCount {
-									log.Printf("已捕获 %d 个数据包，程序退出", packetCounter)
-									cancel() // 触发程序退出
-									pendingMu.Unlock()
-									return
-								}
-							}
-
-							// 清空待打印队列
-							pendingEvents = pendingEvents[:0]
-						}
-						pendingMu.Unlock()
-					}
-				}
-			}()
-		}
-
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 		for {
-			select {
-			case <-ctx.Done():
+			record, err := rb.Read()
+			if err != nil {
+				if errors.Is(err, ringbuf.ErrClosed) || ctx.Err() != nil {
+					return
+				}
+				log.Printf("Error reading from network packet ring buffer: %v", err)
+				continue
+			}
+
+			var event core.SoEvent
+			if len(record.RawSample) < int(unsafe.Sizeof(event)) {
+				log.Printf("Network packet event data too short: %d bytes", len(record.RawSample))
+				continue
+			}
+			event = *(*core.SoEvent)(unsafe.Pointer(&record.RawSample[0]))
+
+			if *showPacketID {
+				if !printDirectEvent(&event) {
+					return
+				}
+				continue
+			}
+
+			if !merger.AddEvent(&event) {
+				continue
+			}
+			group := merger.GetAndRemoveGroup(core.GetPacketKey(&event))
+			if group == nil {
+				continue
+			}
+			if !printMergedGroup(group) {
 				return
-			default:
-				record, err := rb.Read()
-				if err != nil {
-					if errors.Is(err, ringbuf.ErrClosed) {
-						return
-					}
-					log.Printf("Error reading from network packet ring buffer: %v", err)
-					continue
-				}
-
-				// Parse the network packet event
-				var event core.SoEvent
-				if len(record.RawSample) < int(unsafe.Sizeof(event)) {
-					log.Printf("Network packet event data too short: %d bytes", len(record.RawSample))
-					continue
-				}
-
-				// Copy data directly from RawSample
-				event = *(*core.SoEvent)(unsafe.Pointer(&record.RawSample[0]))
-
-				// 根据 -ID 参数决定处理方式
-				if *showPacketID {
-					// 有 -ID 参数，直接打印，不合并
-					formattedEvent := colorManager.FormatEvent(&event, symbolResolver)
-
-					// 输出格式化的事件
-					fmt.Fprintf(outputWriter, "%-20s %-15s %-15s %-8s %-6d %-17s %-3s %-20s\n",
-						formattedEvent.Time, formattedEvent.SrcIP, formattedEvent.DstIP,
-						formattedEvent.Protocol, formattedEvent.Length, formattedEvent.SrcMAC,
-						formattedEvent.TTL, formattedEvent.Info)
-
-					// 增加包计数器
-					packetCounter++
-
-					// 检查是否达到指定的包数量
-					if *packetCount > 0 && packetCounter >= *packetCount {
-						log.Printf("已捕获 %d 个数据包，程序退出", packetCounter)
-						cancel() // 触发程序退出
-						return
-					}
-				} else {
-					// 没有 -ID 参数，使用合并器
-					shouldPrint := merger.AddEvent(&event)
-
-					if shouldPrint {
-						// 立即打印（例如收到 kfree_skb）
-						key := core.GetPacketKey(&event)
-						group := merger.GetAndRemoveGroup(key)
-						if group != nil {
-							// 使用合并后的 Info 信息（FormatMergedInfo 内部会安全访问 Events）
-							mergedInfo, lastEvent := core.FormatMergedInfoWithRetransmission(group, symbolResolver, retransmissionDetector, !disableColor)
-							if mergedInfo == "" || lastEvent == nil {
-								continue
-							}
-
-							// 使用最后一个事件来格式化输出（但 Info 使用合并后的）
-							formattedEvent := colorManager.FormatEvent(lastEvent, symbolResolver)
-							formattedEvent.Info = mergedInfo
-
-							// 输出格式化的事件
-							fmt.Fprintf(outputWriter, "%-20s %-15s %-15s %-8s %-6d %-17s %-3s %-20s\n",
-								formattedEvent.Time, formattedEvent.SrcIP, formattedEvent.DstIP,
-								formattedEvent.Protocol, formattedEvent.Length, formattedEvent.SrcMAC,
-								formattedEvent.TTL, formattedEvent.Info)
-
-							// 增加包计数器
-							packetCounter++
-
-							// 检查是否达到指定的包数量
-							if *packetCount > 0 && packetCounter >= *packetCount {
-								log.Printf("已捕获 %d 个数据包，程序退出", packetCounter)
-								cancel() // 触发程序退出
-								return
-							}
-						}
-					}
-				}
 			}
 		}
 	}()
-	// Wait for context cancellation
+
 	<-ctx.Done()
+	wg.Wait()
+
+	if merger != nil && !limitReached.Load() {
+		for _, group := range merger.DrainGroups() {
+			pendingQueue.Enqueue(group)
+		}
+		for _, group := range pendingQueue.Drain() {
+			if !printMergedGroup(group) {
+				break
+			}
+		}
+	}
+
+	if outputFileHandle != nil {
+		_ = outputFileHandle.Sync()
+	}
+
+	log.Printf("监控已停止，退出原因: %s", getExitReason())
+	if aiOptions.Enabled {
+		log.Println("开始执行 AI 诊断...")
+		reportOutput, err := runAIDiagnosis(aiOptions, captureBuffer, startTime, getExitReason())
+		if err != nil {
+			log.Printf("AI 诊断失败: %v", err)
+			if reportOutput != nil {
+				if reportOutput.CaptureDownloadURL != "" {
+					log.Printf("抓包文件下载链接: %s", reportOutput.CaptureDownloadURL)
+				}
+				log.Printf("诊断报告已写入: %s", reportOutput.ReportPath)
+				if reportOutput.RawResponsePath != "" {
+					log.Printf("AI 原始响应已保存: %s", reportOutput.RawResponsePath)
+				}
+			}
+		} else if reportOutput != nil {
+			printDiagnosisPreview(reportOutput.ReportPath)
+			if reportOutput.CaptureDownloadURL != "" {
+				log.Printf("抓包文件下载链接: %s", reportOutput.CaptureDownloadURL)
+			}
+			log.Printf("AI 诊断完成，详细报告见: %s", reportOutput.ReportPath)
+			if reportOutput.RawResponsePath != "" {
+				log.Printf("AI 原始响应已保存: %s", reportOutput.RawResponsePath)
+			}
+		}
+	}
+
 	fmt.Println("监控已停止")
+}
+
+func defaultAIUser() string {
+	user := os.Getenv("USER")
+	if user == "" {
+		return "netbee"
+	}
+	return user
+}
+
+func resolveAPIKey(flagValue string) string {
+	if strings.TrimSpace(flagValue) != "" {
+		return strings.TrimSpace(flagValue)
+	}
+	return strings.TrimSpace(os.Getenv("NETBEE_AI_API_KEY"))
+}
+
+func defaultReportPathHint(path string) string {
+	if path != "" {
+		return path
+	}
+	return "diagnosis-YYYYMMDD-HHMMSS.md"
+}
+
+func printDiagnosisPreview(reportPath string) {
+	lines, err := extractDiagnosisPreview(reportPath, 5)
+	if err != nil {
+		log.Printf("读取 AI 诊断摘要失败: %v", err)
+		return
+	}
+	if len(lines) == 0 {
+		return
+	}
+	lines = formatDiagnosisPreviewLines(lines)
+	if len(lines) == 0 {
+		return
+	}
+
+	log.Println("AI 诊断摘要:")
+	for _, line := range lines {
+		log.Printf("  %s", line)
+	}
+}
+
+func extractDiagnosisPreview(reportPath string, maxLines int) ([]string, error) {
+	content, err := os.ReadFile(reportPath)
+	if err != nil {
+		return nil, err
+	}
+
+	text := string(content)
+	lines := make([]string, 0, 12)
+	lines = append(lines, extractPreferredSummaryLines(text)...)
+	lines = append(lines, extractConclusionPreviewLines(text, maxLines)...)
+	return lines, nil
+}
+
+func extractSection(content, startMarker, endMarker string) string {
+	start := strings.Index(content, startMarker)
+	if start == -1 {
+		return ""
+	}
+
+	section := content[start+len(startMarker):]
+	section = strings.TrimLeft(section, "\r\n")
+
+	if endMarker != "" {
+		if end := strings.Index(section, endMarker); end != -1 {
+			section = section[:end]
+		}
+	}
+
+	return strings.TrimSpace(section)
+}
+
+func extractPreferredSummaryLines(content string) []string {
+	targetPrefixes := []string{
+		"- 抓包文本大小:",
+		"- 抓包有效行数:",
+		"- 协议分布:",
+		"- DROP 次数:",
+		"- TCP 重传次数:",
+		"- RST 次数:",
+	}
+
+	rawLines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+	result := make([]string, 0, len(targetPrefixes))
+	for _, prefix := range targetPrefixes {
+		for _, line := range rawLines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, prefix) {
+				result = append(result, line)
+				break
+			}
+		}
+	}
+
+	return result
+}
+
+func extractConclusionPreviewLines(content string, maxLines int) []string {
+	section := extractSection(content, "# 综合结论", "## AI 调用元数据")
+	if section == "" {
+		section = extractSection(content, "## 综合结论", "## AI 调用元数据")
+	}
+	if section == "" {
+		section = extractSection(content, "# 结论", "## AI 调用元数据")
+	}
+	if section == "" {
+		section = extractSection(content, "## 结论", "## AI 调用元数据")
+	}
+	if section == "" {
+		return nil
+	}
+
+	rawLines := strings.Split(strings.ReplaceAll(section, "\r\n", "\n"), "\n")
+	lines := make([]string, 0, len(rawLines)+1)
+	lines = append(lines, "# 综合结论")
+	for _, line := range rawLines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "```") {
+			continue
+		}
+		lines = append(lines, line)
+		if line == "---" {
+			break
+		}
+	}
+
+	return lines
+}
+
+func formatDiagnosisPreviewLines(lines []string) []string {
+	result := make([]string, 0, len(lines))
+	headingIndex := 0
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		if strings.HasPrefix(line, "#") {
+			title := strings.TrimSpace(strings.TrimLeft(line, "#"))
+			if title == "" {
+				continue
+			}
+			if title == "综合结论" {
+				result = append(result, title)
+				continue
+			}
+
+			headingIndex++
+			result = append(result, fmt.Sprintf("%d. %s", headingIndex, title))
+			continue
+		}
+
+		if line == "---" {
+			result = append(result, line)
+			continue
+		}
+
+		if stripped, ok := trimNumericListPrefix(line); ok {
+			line = stripped
+		}
+
+		if strings.HasPrefix(line, "- ") {
+			result = append(result, line)
+			continue
+		}
+
+		result = append(result, "- "+line)
+	}
+
+	return result
+}
+
+func trimNumericListPrefix(line string) (string, bool) {
+	if line == "" {
+		return line, false
+	}
+
+	i := 0
+	for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+		i++
+	}
+	if i == 0 || i+1 >= len(line) || line[i] != '.' || line[i+1] != ' ' {
+		return line, false
+	}
+
+	return strings.TrimSpace(line[i+2:]), true
+}
+
+func formatHeaderLine() string {
+	return fmt.Sprintf("%-20s %-15s %-15s %-8s %-6s %-17s %-3s %-20s\n",
+		"Time", "SrcIP", "DstIP", "Protocol", "Length", "SrcMAC", "TTL", "Info")
+}
+
+func formatHeaderSeparatorLine() string {
+	return fmt.Sprintf("%-20s %-15s %-15s %-8s %-6s %-17s %-3s %-20s\n",
+		"----", "-----", "-----", "--------", "------", "------", "---", "----")
+}
+
+func formatTableLine(formattedEvent *color.FormattedEvent) string {
+	return fmt.Sprintf("%-20s %-15s %-15s %-8s %-6d %-17s %-3s %-20s\n",
+		formattedEvent.Time, formattedEvent.SrcIP, formattedEvent.DstIP,
+		formattedEvent.Protocol, formattedEvent.Length, formattedEvent.SrcMAC,
+		formattedEvent.TTL, formattedEvent.Info)
+}
+
+func writeOutputLine(outputWriter io.Writer, captureBuffer *diagnose.CaptureBuffer, line string) error {
+	if _, err := io.WriteString(outputWriter, line); err != nil {
+		return err
+	}
+	if captureBuffer != nil {
+		return captureBuffer.WritePlainText(line)
+	}
+	return nil
+}
+
+func runAIDiagnosis(opts diagnose.Options, captureBuffer *diagnose.CaptureBuffer, startTime time.Time, exitReason string) (*diagnose.ReportOutput, error) {
+	if captureBuffer == nil {
+		return nil, fmt.Errorf("未找到 AI 诊断抓包内容")
+	}
+
+	captureBytes, err := captureBuffer.ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("读取抓包内容失败: %w", err)
+	}
+
+	summary := diagnose.BuildSummary(
+		string(captureBytes),
+		captureBuffer.Size(),
+		strings.Join(os.Args, " "),
+		startTime,
+		time.Now(),
+		exitReason,
+	)
+
+	client := diagnose.NewClient(opts)
+	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
+	defer cancel()
+
+	result, analyzeErr := client.Analyze(ctx, opts, summary, captureBytes)
+	var rawResponse []byte
+	if apiErr, ok := analyzeErr.(*diagnose.APIError); ok {
+		rawResponse = []byte(apiErr.Body)
+	}
+	reportOutput, reportErr := diagnose.WriteReport(diagnose.ReportInput{
+		Summary:       summary,
+		Result:        result,
+		ReportError:   analyzeErr,
+		RawResponse:   rawResponse,
+		RawSave:       opts.SaveRaw,
+		RequestedPath: opts.OutputPath,
+	})
+	if reportErr != nil {
+		return nil, reportErr
+	}
+	if analyzeErr != nil {
+		return reportOutput, analyzeErr
+	}
+	return reportOutput, nil
+}
+
+func (q *pendingGroupQueue) Enqueue(group *core.PacketEventGroup) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.events = append(q.events, pendingEvent{
+		group:     group,
+		firstTime: group.GetFirstTime(),
+	})
+}
+
+func (q *pendingGroupQueue) Drain() []*core.PacketEventGroup {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if len(q.events) == 0 {
+		return nil
+	}
+
+	events := make([]pendingEvent, len(q.events))
+	copy(events, q.events)
+	q.events = q.events[:0]
+
+	for i := 0; i < len(events)-1; i++ {
+		for j := i + 1; j < len(events); j++ {
+			if events[i].firstTime.After(events[j].firstTime) {
+				events[i], events[j] = events[j], events[i]
+			}
+		}
+	}
+
+	groups := make([]*core.PacketEventGroup, 0, len(events))
+	for _, event := range events {
+		groups = append(groups, event.group)
+	}
+	return groups
 }

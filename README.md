@@ -59,6 +59,11 @@
    - 显示处理结果（ACCEPT、DROP、OTHER）
    - DROP 结果自动标记为红色
 
+7. **AI 诊断报告**
+   - 使用 `-AI` 在抓包结束后自动调用云端 AI 进行诊断
+   - 自动生成抓包摘要、上传完整抓包文本，并输出本地 Markdown/TXT 报告
+   - 控制台打印诊断摘要、抓包文件下载链接和详细报告路径，便于快速分享与复盘
+
 ## 1. 项目架构设计
 
 ### 整体架构
@@ -334,7 +339,84 @@ sudo ./target/netbee -w output.txt
 
 # 显示 packet ID，不进行合并（每个事件单独显示）
 sudo ./target/netbee -ID
+
+# 抓取 100 个包后自动执行 AI 诊断
+sudo NETBEE_AI_API_KEY=your-token ./target/netbee -c 100 -AI -ai-user xufanyun
+
+# 指定 AI 报告文件名，并保存原始 AI 响应
+sudo NETBEE_AI_API_KEY=your-token ./target/netbee -proto tcp -c 200 -AI -ai-user xufanyun -ai-out diagnosis.md -ai-raw-save
 ```
+
+#### AI 诊断说明
+
+当启用 `-AI` 后，NetBee 会在抓包结束时自动触发一次云端 AI 诊断。触发时机包括：
+
+- 达到 `-c` 指定的抓包数量后自动退出
+- 用户按下 `Ctrl+C`
+- 程序正常结束
+
+AI 诊断流程如下：
+
+1. 本地先根据抓包结果生成统计摘要
+2. 将完整抓包文本上传为临时文件，并把下载链接关联给 AI
+3. 以阻塞方式等待 AI 返回诊断结论
+4. 将完整结果写入本地 `md` 或 `txt` 报告
+5. 在控制台打印诊断摘要、抓包文件下载链接和报告路径
+
+启用 `-AI` 后的输出行为：
+
+- 控制台默认不再实时输出抓包明细，避免大量刷屏
+- 抓包原文仍会被完整采集，用于上传和生成诊断
+- 如果同时指定 `-w`，抓包明细仍会额外写入你指定的文件
+
+常用参数说明：
+
+- `-AI`：开启 AI 诊断
+- `-ai-user`：AI 请求中的用户标识，建议传入真实域账号，例如 `xufanyun`
+- `-ai-out`：指定诊断报告输出路径，默认生成 `diagnosis-YYYYMMDD-HHMMSS.md`
+- `-ai-timeout`：AI 诊断总超时时间，默认 `120s`
+- `-ai-raw-save`：额外保存 AI 原始 JSON 响应，便于调试
+- `-ai-api-key`：直接传入 AI 鉴权 token；如果不传，则读取环境变量 `NETBEE_AI_API_KEY`
+
+推荐使用方式：
+
+```bash
+# 最常用：抓一定数量后自动出诊断
+sudo NETBEE_AI_API_KEY=your-token ./target/netbee -c 100 -AI -ai-user xufanyun
+
+# 排查 SSH/HTTP 等特定流量
+sudo NETBEE_AI_API_KEY=your-token ./target/netbee -proto tcp -port 22 -c 200 -AI -ai-user xufanyun
+
+# 诊断耗时较长时，适当增加超时
+sudo NETBEE_AI_API_KEY=your-token ./target/netbee -proto tcp -c 300 -AI -ai-user xufanyun -ai-timeout 5m
+```
+
+#### AI 使用效果
+
+控制台示例：
+
+```text
+2026/03/16 15:39:35 AI 模式已启用，控制台不再输出抓包明细
+2026/03/16 15:39:50 开始执行 AI 诊断...
+AI 诊断摘要:
+1. 抓包概况
+- 抓包文本大小: 154323 bytes
+- 抓包有效行数: 842
+- 协议分布: TCP=842, UDP=0, ICMP=0
+- DROP 次数: 0
+- TCP 重传次数: 117
+- RST 次数: 0
+2. 综合结论
+- 回环链路与 SSH 会话均存在高密度 TCP 重传，但未见 DROP/RST，初步判断更像发送/接收端状态不一致或链路抖动后的重复发送。
+2026/03/16 15:40:12 抓包文件下载链接: https://example.com/netbee-capture.txt
+2026/03/16 15:40:12 AI 诊断完成，详细报告见: diagnosis-20260316-154012.md
+```
+
+生成的诊断报告通常包含以下内容：
+
+- 基本信息：运行命令、开始/结束时间、统计摘要、抓包文件下载链接
+- AI 诊断结果：按固定章节输出综合结论、已知异常、最可能根因、建议动作等内容
+- AI 调用元数据：任务 ID、耗时、token 消耗、是否走文件上传等调试信息
 
 #### 命令行参数
 
@@ -359,6 +441,12 @@ sudo ./target/netbee -ID
 - `-w string`: 将输出内容保存到指定文件（自动禁用颜色）
 - `-c int`: 捕获指定数量的数据包后自动退出
 - `-ID`: 显示 packet ID，不进行合并（默认：合并相同 packet ID 的数据包）
+- `-AI`: 抓包结束时调用云端 AI 诊断，并将结果写入本地报告
+- `-ai-user string`: AI 诊断请求中的 `user` 字段
+- `-ai-out string`: AI 诊断报告输出路径（默认按时间戳生成 `.md` 文件）
+- `-ai-timeout duration`: AI 诊断接口总超时时间
+- `-ai-raw-save`: 保存 AI 原始响应 JSON 文件，便于调试
+- `-ai-api-key string`: AI 接口鉴权 token（默认读取 `NETBEE_AI_API_KEY`）
 - `-help`: 显示详细帮助信息
 
 ### 输出说明
