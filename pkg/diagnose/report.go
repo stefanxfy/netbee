@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const conversationIDFileName = "netbee-ai-conversation-id.txt"
+
 // ReportInput 是诊断报告生成所需的数据。
 type ReportInput struct {
 	Summary       Summary
@@ -24,17 +26,12 @@ type ReportOutput struct {
 	ReportPath         string
 	RawResponsePath    string
 	CaptureDownloadURL string
+	ConversationIDPath string
 }
 
 // WriteReport 将 AI 诊断结果落盘为 Markdown 或 TXT 文件。
 func WriteReport(input ReportInput) (*ReportOutput, error) {
-	reportPath := input.RequestedPath
-	if strings.TrimSpace(reportPath) == "" {
-		reportPath = fmt.Sprintf("diagnosis-%s.md", time.Now().Format("20060102-150405"))
-	}
-	if filepath.Ext(reportPath) == "" {
-		reportPath += ".md"
-	}
+	reportPath := ResolveReportPath(input.RequestedPath, time.Now())
 
 	content, err := buildReportContent(reportPath, input)
 	if err != nil {
@@ -67,8 +64,64 @@ func WriteReport(input ReportInput) (*ReportOutput, error) {
 		}
 		output.RawResponsePath = rawPath
 	}
+	if input.Result != nil {
+		conversationID := strings.TrimSpace(input.Result.Response.ConversationID)
+		if conversationID != "" {
+			conversationPath, err := saveConversationID(reportPath, conversationID)
+			if err != nil {
+				return nil, err
+			}
+			output.ConversationIDPath = conversationPath
+		}
+	}
 
 	return output, nil
+}
+
+// ResolveReportPath 根据用户请求生成最终报告路径。
+func ResolveReportPath(requestedPath string, now time.Time) string {
+	reportPath := strings.TrimSpace(requestedPath)
+	if reportPath == "" {
+		reportPath = fmt.Sprintf("diagnosis-%s.md", now.Format("20060102-150405"))
+	}
+	if filepath.Ext(reportPath) == "" {
+		reportPath += ".md"
+	}
+	return reportPath
+}
+
+// ConversationIDPath 返回 conversation_id 文件路径。
+func ConversationIDPath(reportPath string) string {
+	dir := filepath.Dir(reportPath)
+	if dir == "" {
+		dir = "."
+	}
+	return filepath.Join(dir, conversationIDFileName)
+}
+
+// LoadConversationID 读取上次保存的 conversation_id。
+func LoadConversationID(reportPath string) (string, string, error) {
+	path := ConversationIDPath(reportPath)
+	content, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", path, nil
+		}
+		return "", path, err
+	}
+	conversationID := strings.TrimSpace(string(content))
+	if conversationID == "" {
+		return "", path, fmt.Errorf("conversation_id 文件为空: %s", path)
+	}
+	return conversationID, path, nil
+}
+
+func saveConversationID(reportPath, conversationID string) (string, error) {
+	path := ConversationIDPath(reportPath)
+	if err := os.WriteFile(path, []byte(strings.TrimSpace(conversationID)+"\n"), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func buildReportContent(reportPath string, input ReportInput) (string, error) {

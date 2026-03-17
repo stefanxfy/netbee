@@ -67,6 +67,7 @@ func main() {
 		aiOut     = flag.String("ai-out", "", "AI 诊断报告输出路径（默认按时间戳生成 .md 文件）")
 		aiTimeout = flag.Duration("ai-timeout", 120*time.Second, "AI 诊断接口总超时时间")
 		aiRawSave = flag.Bool("ai-raw-save", false, "保存 AI 原始响应 JSON 文件，便于调试")
+		aiKeep    = flag.Bool("keep", false, "继续使用上次 AI 诊断的 conversation_id")
 		aiAPIKey  = flag.String("ai-api-key", "", "AI 接口鉴权 token（默认读取 NETBEE_AI_API_KEY）")
 		aiAPIURL  = flag.String("ai-api-url", "", "AI 接口地址（默认使用内置 Dify 地址）")
 
@@ -90,14 +91,15 @@ func main() {
 	log.Printf("操作系统: %s", runtime.GOOS)
 
 	aiOptions := diagnose.Options{
-		Enabled:     *enableAI,
-		APIURL:      *aiAPIURL,
-		APIKey:      resolveAPIKey(*aiAPIKey),
-		User:        *aiUser,
-		OutputPath:  *aiOut,
-		Timeout:     *aiTimeout,
-		SaveRaw:     *aiRawSave,
-		MemoryLimit: 2 * 1024 * 1024,
+		Enabled:          *enableAI,
+		APIURL:           *aiAPIURL,
+		APIKey:           resolveAPIKey(*aiAPIKey),
+		User:             *aiUser,
+		OutputPath:       *aiOut,
+		Timeout:          *aiTimeout,
+		SaveRaw:          *aiRawSave,
+		KeepConversation: *aiKeep,
+		MemoryLimit:      2 * 1024 * 1024,
 	}
 	if aiOptions.Enabled && aiOptions.APIKey == "" {
 		log.Fatal("启用 -AI 时必须通过 NETBEE_AI_API_KEY 或 -ai-api-key 提供接口鉴权 token")
@@ -438,6 +440,9 @@ func main() {
 				if reportOutput.CaptureDownloadURL != "" {
 					log.Printf("抓包文件下载链接: %s", reportOutput.CaptureDownloadURL)
 				}
+				if reportOutput.ConversationIDPath != "" {
+					log.Printf("AI 会话 ID 已保存: %s", reportOutput.ConversationIDPath)
+				}
 				log.Printf("诊断报告已写入: %s", reportOutput.ReportPath)
 				if reportOutput.RawResponsePath != "" {
 					log.Printf("AI 原始响应已保存: %s", reportOutput.RawResponsePath)
@@ -447,6 +452,9 @@ func main() {
 			printDiagnosisPreview(reportOutput.ReportPath)
 			if reportOutput.CaptureDownloadURL != "" {
 				log.Printf("抓包文件下载链接: %s", reportOutput.CaptureDownloadURL)
+			}
+			if reportOutput.ConversationIDPath != "" {
+				log.Printf("AI 会话 ID 已保存: %s", reportOutput.ConversationIDPath)
 			}
 			log.Printf("AI 诊断完成，详细报告见: %s", reportOutput.ReportPath)
 			if reportOutput.RawResponsePath != "" {
@@ -683,6 +691,20 @@ func runAIDiagnosis(opts diagnose.Options, captureBuffer *diagnose.CaptureBuffer
 	if captureBuffer == nil {
 		return nil, fmt.Errorf("未找到 AI 诊断抓包内容")
 	}
+	reportPath := diagnose.ResolveReportPath(opts.OutputPath, time.Now())
+	opts.OutputPath = reportPath
+	if opts.KeepConversation {
+		conversationID, conversationPath, err := diagnose.LoadConversationID(reportPath)
+		if err != nil {
+			return nil, err
+		}
+		if conversationID != "" {
+			opts.ConversationID = conversationID
+			log.Printf("检测到上次 AI 会话文件，准备校验合法性: %s", conversationPath)
+		} else {
+			log.Printf("未找到上次 conversation_id 文件，按首次诊断处理: %s", conversationPath)
+		}
+	}
 
 	captureBytes, err := captureBuffer.ReadAll()
 	if err != nil {
@@ -701,6 +723,17 @@ func runAIDiagnosis(opts diagnose.Options, captureBuffer *diagnose.CaptureBuffer
 	client := diagnose.NewClient(opts)
 	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
 	defer cancel()
+	if strings.TrimSpace(opts.ConversationID) != "" {
+		valid, err := client.ValidateConversation(ctx, opts.User, opts.ConversationID)
+		if err != nil {
+			log.Printf("校验 conversation_id 失败，将继续尝试沿用会话: %v", err)
+		} else if !valid {
+			log.Printf("conversation_id 预检无效，按首次诊断处理: %s", opts.ConversationID)
+			opts.ConversationID = ""
+		} else {
+			log.Printf("conversation_id 校验通过，继续沿用历史会话")
+		}
+	}
 
 	result, analyzeErr := client.Analyze(ctx, opts, summary, captureBytes)
 	var rawResponse []byte
@@ -713,7 +746,7 @@ func runAIDiagnosis(opts diagnose.Options, captureBuffer *diagnose.CaptureBuffer
 		ReportError:   analyzeErr,
 		RawResponse:   rawResponse,
 		RawSave:       opts.SaveRaw,
-		RequestedPath: opts.OutputPath,
+		RequestedPath: reportPath,
 	})
 	if reportErr != nil {
 		return nil, reportErr
